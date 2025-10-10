@@ -14,6 +14,7 @@ import json
 import rasterio as rio
 import numpy as np
 import tensorflow as tf
+from imageio import imread
 
 from doodleverse_utils.imports import *
 from doodleverse_utils.model_imports import *
@@ -246,6 +247,9 @@ def seg_gym_folder(imgDF: pd.DataFrame,
                       USE_DROPOUT_ON_UPSAMPLING=config['USE_DROPOUT_ON_UPSAMPLING']
                       )
     
+    # Load the weights
+    model.load_weights(weights)
+    
     file_paths = imgDF["mosaic"].tolist()
     target_size = config['TARGET_SIZE']
     n_data_bands = config['N_DATA_BANDS']
@@ -271,6 +275,9 @@ def seg_gym_folder(imgDF: pd.DataFrame,
     for i, (batch, batch_paths) in enumerate(zip(ds, [file_paths[j:j+batch_size] for j in range(0, len(file_paths), batch_size)])):
         preds = model.predict(batch, verbose=1)
 
+        # print('\n\n\n')
+        # print_attrs(preds)
+
         # Save softmax scores for each image in the batch
         for pred, path in zip(preds['logits'], batch_paths):
             base = os.path.splitext(os.path.basename(path))[0]
@@ -280,4 +287,122 @@ def seg_gym_folder(imgDF: pd.DataFrame,
     return imgDF
 
 
+
+
+#=======================================================================
+def seg_gym_folder_noDL(imgDF: pd.DataFrame,
+                   modelDir: str,
+                   out_dir: str,
+                   batch_size: int=8
+                   ):
+    '''
+    do segmentation without a dataloader
+    '''
+
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+
+    # Get necessary model files
+    configFile = glob(os.path.join(modelDir, 'config', '*.json'))[0]
+    weights = glob(os.path.join(modelDir, 'weights', '*_fullmodel.h5'))[0]
+
+    # Get info from configfile
+    with open(configFile) as f:
+        config = json.load(f)
+
+    model = get_model(modelDir=modelDir,
+                      MODEL=config['MODEL'],
+                      TARGET_SIZE=config['TARGET_SIZE'],
+                      N_DATA_BANDS=config['N_DATA_BANDS'],
+                      FILTERS=config['FILTERS'],
+                      NCLASSES=config['NCLASSES'],
+                      KERNEL=config['KERNEL'],
+                      STRIDE=config['STRIDE'],
+                      DROPOUT=config['DROPOUT'],
+                      DROPOUT_CHANGE_PER_LAYER=config['DROPOUT_CHANGE_PER_LAYER'],
+                      DROPOUT_TYPE=config['DROPOUT_TYPE'],
+                      USE_DROPOUT_ON_UPSAMPLING=config['USE_DROPOUT_ON_UPSAMPLING']
+                      )
+    
+    # Load the weights
+    model.load_weights(weights)
+    
+    file_paths = imgDF["mosaic"].tolist()
+    target_size = config['TARGET_SIZE']
+    n_data_bands = config['N_DATA_BANDS']
+
+    if n_data_bands < 3 and config['MODEL'] == 'segformer':
+        n_data_bands = 3  # Segformer expects 3 bands for RGB input
+
+    for im_path in file_paths:
+        # Get image basename
+        basename = os.path.splitext(os.path.basename(im_path))[0]
+
+        # Load image directly (avoid tf.numpy_function here because that
+        # can wrap the path in an array-like and pass that to imread).
+        image = get_image(im_path, n_data_bands, target_size, config['MODEL'])
+
+        # Ensure batch dimension for model.predict: shape should be (1, ...)
+        try:
+            import numpy as _np
+            batch = _np.expand_dims(image, 0)
+        except Exception:
+            batch = image
+
+        preds = model.predict(batch, verbose=0)
+
+        # preds may be a dict (e.g., {'logits': array}) or an array with batch dim.
+        if isinstance(preds, dict):
+            # Extract logits/softmax and remove batch dim
+            arr = preds['logits']
+        else:
+            arr = preds
+
+        # If arr has a batch dimension, take first element
+        try:
+            arr0 = arr[0]
+        except Exception:
+            arr0 = arr
+
+        npz_path = os.path.join(out_dir, f"{basename}.npz")
+        np.savez_compressed(npz_path, softmax=arr0)
+
+    return(imgDF)
+
+
+
+
+# For Debug
+import reprlib, inspect
+def short_repr(x, maxlen=200):
+    try:
+        r = repr(x)
+    except Exception:
+        return f"<unrepr-able {type(x).__name__}>"
+    if len(r) > maxlen:
+        return r[:maxlen] + '...'
+    return r
+
+def print_attrs(obj, show_private=False, maxlen=200):
+    print("Type:", type(obj))
+    # If object has __dict__ show those first
+    d = getattr(obj, '__dict__', None)
+    if d:
+        print("__dict__:")
+        for k, v in d.items():
+            if not show_private and k.startswith('_'):
+                continue
+            print(f"  {k} ({type(v).__name__}): {short_repr(v, maxlen)}")
+        return
+
+    # fallback: inspect.getmembers
+    for name, val in inspect.getmembers(obj):
+        if not show_private and name.startswith('_'):
+            continue
+        # skip bound methods if you want only attributes
+        if inspect.ismethod(val) or inspect.isfunction(val):
+            print(f"  {name}()  # method")
+        else:
+            print(f"  {name} ({type(val).__name__}): {short_repr(val, maxlen)}")
+# for debug
               
