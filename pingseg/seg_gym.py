@@ -15,6 +15,8 @@ import rasterio as rio
 import numpy as np
 import tensorflow as tf
 from imageio import imread
+from joblib import Parallel, delayed
+from tqdm import tqdm
 
 from doodleverse_utils.imports import *
 from doodleverse_utils.model_imports import *
@@ -217,7 +219,8 @@ def get_image(f: str,
 def seg_gym_folder(imgDF: pd.DataFrame,
                    modelDir: str,
                    out_dir: str,
-                   batch_size: int=8
+                   batch_size: int=8,
+                   threadCnt: int=4
                    ):
     '''
     '''
@@ -278,15 +281,26 @@ def seg_gym_folder(imgDF: pd.DataFrame,
         # print('\n\n\n')
         # print_attrs(preds)
 
-        # Save softmax scores for each image in the batch
-        for pred, path in zip(preds['logits'], batch_paths):
-            base = os.path.splitext(os.path.basename(path))[0]
-            npz_path = os.path.join(out_dir, f"{base}.npz")
-            np.savez_compressed(npz_path, softmax=pred)
+        # # Save softmax scores for each image in the batch
+        # for pred, path in zip(preds['logits'], batch_paths):
+        #     base = os.path.splitext(os.path.basename(path))[0]
+        #     npz_path = os.path.join(out_dir, f"{base}.npz")
+        #     np.savez_compressed(npz_path, softmax=pred)
+
+        Parallel(n_jobs=threadCnt)(delayed(save_npz)(pred, path, out_dir) for pred, path in tqdm(zip(preds['logits'], batch_paths)))
 
     return imgDF
 
 
+#=======================================================================
+def save_npz(pred: np.array, 
+             path: str,
+             out_dir: str
+             ):
+    
+    base = os.path.splitext(os.path.basename(path))[0]
+    npz_path = os.path.join(out_dir, f"{base}.npz")
+    np.savez_compressed(npz_path, softmax=pred)
 
 
 #=======================================================================
