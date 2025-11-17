@@ -125,8 +125,11 @@ def get_model(utils_dir: str,):
 
     # Testing
     rf = roboflow.Roboflow(api_key=my_api_key)
+    print(rf.workspace())
     project = rf.workspace().project(my_model_name)
     model = project.version(my_model_ver).model
+
+    model.download()
 
     print("Model type:", type(model))
     print("Attributes:", [a for a in dir(model) if not a.startswith("_")])
