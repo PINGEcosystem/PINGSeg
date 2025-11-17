@@ -204,11 +204,33 @@ def get_image(f: str,
         MODEL = MODEL.decode()
 
     if str(MODEL) == 'segformer':
+        # Segformer always needs 3 channels
         if np.ndim(image) == 2:
             image = np.dstack((image, image, image))
+        elif image.shape[-1] == 1:
+            image = np.dstack((image, image, image))
+        elif image.shape[-1] > 3:
+            image = image[:,:,:3]
         # Ensure channels first (3, H, W)
         if image.shape[-1] == 3:
             image = np.transpose(image, (2, 0, 1))
+    else:
+        # For non-segformer models, respect N_DATA_BANDS
+        if N_DATA_BANDS == 1:
+            # Return grayscale [H, W]
+            if np.ndim(image) == 3:
+                if image.shape[-1] == 3:
+                    # Convert RGB to grayscale
+                    image = np.mean(image, axis=-1)
+                elif image.shape[-1] == 1:
+                    image = image.squeeze(axis=-1)
+        else:
+            # Multi-band: ensure shape is [H, W, C]
+            if np.ndim(image) == 2:
+                image = np.expand_dims(image, axis=-1)
+            elif image.shape[-1] != N_DATA_BANDS:
+                # If we have wrong number of bands, take first N_DATA_BANDS
+                image = image[:, :, :N_DATA_BANDS]
 
     image = image.astype(np.float32)
 
@@ -267,7 +289,23 @@ def seg_gym_folder(imgDF: pd.DataFrame,
             inp=[path, n_data_bands, target_size, config['MODEL']],
             Tout=tf.float32
         )
-        img.set_shape([n_data_bands, target_size[0], target_size[1]])
+        # get_image returns [C, H, W] for segformer, but [H, W, C] for others
+        # set expected output shape based on model type
+        if config['MODEL'] == 'segformer':
+            # segformer expects channels-first: [C, H, W]
+            img.set_shape([n_data_bands, target_size[0], target_size[1]])
+        else:
+            # other models expect channels-last: [H, W, C]
+            # Handle 2D (grayscale) vs 3D (multi-band)
+            if n_data_bands == 1:
+                # img is [H, W], add channel dim to get [H, W, 1]
+                img = tf.expand_dims(img, axis=-1)
+                img.set_shape([target_size[0], target_size[1], 1])
+            else:
+                # img is [C, H, W], transpose to [H, W, C]
+                img = tf.transpose(img, [1, 2, 0])
+                img.set_shape([target_size[0], target_size[1], n_data_bands])
+        
         return img
 
     ds = tf.data.Dataset.from_tensor_slices(file_paths)
@@ -287,7 +325,15 @@ def seg_gym_folder(imgDF: pd.DataFrame,
         #     npz_path = os.path.join(out_dir, f"{base}.npz")
         #     np.savez_compressed(npz_path, softmax=pred)
 
-        Parallel(n_jobs=threadCnt)(delayed(save_npz)(pred, path, out_dir) for pred, path in tqdm(zip(preds['logits'], batch_paths)))
+        # Extract predictions based on model type
+        if config['MODEL'] == 'segformer':
+            # Segformer returns dict with 'logits' key
+            pred_array = preds['logits']
+        else:
+            # Other models return numpy array directly
+            pred_array = preds
+
+        Parallel(n_jobs=threadCnt)(delayed(save_npz)(pred, path, out_dir) for pred, path in tqdm(zip(pred_array, batch_paths)))
 
     return imgDF
 
@@ -382,7 +428,6 @@ def seg_gym_folder_noDL(imgDF: pd.DataFrame,
         np.savez_compressed(npz_path, softmax=arr0)
 
     return(imgDF)
-
 
 
 
