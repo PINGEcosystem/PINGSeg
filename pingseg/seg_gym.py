@@ -346,7 +346,12 @@ def save_npz(pred: np.array,
     
     base = os.path.splitext(os.path.basename(path))[0]
     npz_path = os.path.join(out_dir, f"{base}.npz")
-    np.savez_compressed(npz_path, softmax=pred)
+
+    # Save softmax scores using 'with' to ensure file closure
+    with open(npz_path, 'wb') as f:
+        np.savez_compressed(f, softmax=pred)
+
+    return
 
 
 #=======================================================================
