@@ -1,0 +1,25 @@
+name: rf_mapper
+channels:
+  - conda-forge
+dependencies:
+  - python<3.13
+  - gdal
+  - numpy
+  - pandas
+  - geopandas
+  - rasterio
+  - shapely
+  - fiona
+  - joblib
+  - tqdm
+  - scikit-image
+  - pillow
+  - psutil
+  - pip
+  - pip:
+    - pinginstaller
+    - pingtile
+    - pingseg
+    - opencv-python
+    - roboflow
+    - inference

@@ -8,8 +8,8 @@ Adapted from Segmentation Gym: https://github.com/Doodleverse/segmentation_gym
 #########
 # Imports
 import os
+import tempfile
 import pandas as pd
-
 
 import base64
 import io
@@ -18,6 +18,8 @@ from typing import Dict, Any, Optional, List, Tuple
 import numpy as np
 from PIL import Image
 import cv2
+import rasterio as rio
+from rasterio.transform import from_bounds as rio_from_bounds
 from shapely.geometry import Polygon, mapping
 from shapely.ops import unary_union
 
@@ -202,58 +204,181 @@ def _find_segmentation_mask(obj: Any) -> Optional[Tuple[str, List[str]]]:
 
 
 
+def _prepare_tile_for_inference(tile_path: str):
+    """
+    Read a tile (1-band or 3-band GeoTIFF) and produce a clean 3-band PNG suitable
+    for Roboflow inference.
+
+    For 1-band tiles (grayscale sonar), the single channel is replicated to RGB.
+    For 3-band tiles, the first three bands are used directly.
+
+    Returns
+    -------
+    (infer_path, is_temp) : str, bool
+        infer_path  – path to the PNG to send to the model.
+        is_temp     – True when infer_path is a temporary file that the caller must delete.
+    """
+    with rio.open(tile_path) as src:
+        band_count = src.count
+        data = src.read()  # (bands, H, W)
+
+    if band_count == 1:
+        gray = data[0].astype(np.uint8)
+        rgb = np.stack([gray, gray, gray], axis=-1)  # (H, W, 3)
+    else:
+        rgb = np.moveaxis(data[:3], 0, -1).astype(np.uint8)  # (H, W, 3)
+
+    img = Image.fromarray(rgb, mode='RGB')
+    tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+    tmp.close()
+    img.save(tmp.name)
+    return tmp.name, True
+
+
 #=======================================================================
 def seg_rf_folder(imgDF: pd.DataFrame,
                   my_api_key: str,
                   my_model_name: str,
                   my_model_ver: str,
                   out_dir: str,
-                  batch_size: int=8,
-                  threadCnt: int=4):
-    
-    # get the model
+                  minPatchSize: float = 0,
+                  batch_size: int = 8,
+                  threadCnt: int = 1):
+    """
+    Run Roboflow semantic-segmentation inference on each tile in *imgDF* and save
+    a georeferenced GeoTIFF mask for every tile that yields a valid prediction.
+
+    Parameters
+    ----------
+    imgDF : pd.DataFrame
+        Tile index returned by ``doMosaic2tile``.  Must contain columns
+        ``mosaic``, ``x_min``, ``y_min``, ``x_max``, ``y_max``.
+    my_api_key, my_model_name, my_model_ver : str
+        Roboflow credentials and model identifier.
+    out_dir : str
+        Directory where mask GeoTIFFs will be written.
+    minPatchSize : float
+        Minimum patch area in CRS units² (e.g. m²) for the small-object filter.
+        Pass 0 to skip filtering.
+    batch_size, threadCnt : int
+        Kept for API compatibility; inference is currently serial (Roboflow SDK
+        is not thread-safe with a single model instance).
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of *imgDF* with an added ``mask_tif`` column pointing to the saved
+        GeoTIFF for each tile.  Rows whose inference failed are dropped.
+    """
+    from tqdm import tqdm
     from pingseg.rf_utils import get_model_online
+
     model = get_model_online(my_api_key, my_model_name, my_model_ver)
+    os.makedirs(out_dir, exist_ok=True)
 
-    # Do prediction
-    file_paths = imgDF["mosaic"].tolist()
+    # Colour table shared across all tiles (up to 9 classes)
+    _COLORMAP = {
+        0: (51, 102, 204),
+        1: (220, 57, 18),
+        2: (255, 153, 0),
+        3: (16, 150, 24),
+        4: (153, 0, 153),
+        5: (0, 153, 198),
+        6: (221, 68, 119),
+        7: (102, 170, 0),
+        8: (184, 46, 46),
+    }
 
-    for file in file_paths:
-        pred = model.predict(file).json()
+    mask_tif_paths = []
 
-        # Try to find the segmentation_mask in the model response. Many model servers
-        # nest the base64 PNG in different fields; search recursively and accept
-        # data URLs too.
+    for _, row in tqdm(imgDF.iterrows(), total=len(imgDF), desc='RF inference'):
+        tile_path = row['mosaic']
+
+        # ------------------------------------------------------------------
+        # 1. Convert tile to a clean 3-band PNG (handles 1-band & 3-band)
+        # ------------------------------------------------------------------
+        infer_path, is_temp = _prepare_tile_for_inference(tile_path)
+
+        try:
+            pred = model.predict(infer_path).json()
+        finally:
+            if is_temp:
+                try:
+                    os.remove(infer_path)
+                except OSError:
+                    pass
+
+        # ------------------------------------------------------------------
+        # 2. Extract segmentation mask from response
+        # ------------------------------------------------------------------
         found = _find_segmentation_mask(pred)
         if found is None:
-            # helpful debug output: show top-level keys/types so user can adapt
             if isinstance(pred, dict):
                 keys_preview = {k: type(v).__name__ for k, v in pred.items()}
             else:
                 keys_preview = type(pred).__name__
-            print(f"Warning: no segmentation mask found for file {file}.\nResponse top-level keys/types: {keys_preview}\nSkipping this file.")
-            # Optionally you can uncomment the next line to raise instead of skipping
-            # raise ValueError("No 'segmentation_mask' key found in input JSON. Response: {}".format(keys_preview))
+            print(f'Warning: no segmentation mask for {tile_path}. '
+                  f'Response keys: {keys_preview}. Skipping.')
+            mask_tif_paths.append(None)
             continue
 
-        b64_mask, path = found
-        mask_json = {
-            "segmentation_mask": b64_mask,
-            "class_map": pred.get("class_map", CLASS_MAP_DEFAULT) if isinstance(pred, dict) else CLASS_MAP_DEFAULT,
-            "image": pred.get("image", {}) if isinstance(pred, dict) else {}
-        }
-        result = mask_json_to_geojson(mask_json)
+        b64_mask, _ = found
+        mask_arr = decode_mask_png_base64(b64_mask)  # 2D uint8 array of class IDs
 
-        print('\n\n', result)
+        # ------------------------------------------------------------------
+        # 3. Optionally filter small objects
+        # ------------------------------------------------------------------
+        if minPatchSize > 0:
+            x_min_r = row['x_min']
+            x_max_r = row['x_max']
+            pix_m = (x_max_r - x_min_r) / mask_arr.shape[1]
+            try:
+                from pingtile.utils import filterLabel
+                mask_arr = filterLabel(mask_arr.astype(np.uint8),
+                                       min_size=minPatchSize,
+                                       pix_m=pix_m)
+            except Exception as _e:
+                print(f'Warning: filterLabel failed ({_e}); saving unfiltered mask.')
 
-        
+        # ------------------------------------------------------------------
+        # 4. Georeference and save mask GeoTIFF
+        # ------------------------------------------------------------------
+        x_min = row['x_min']
+        y_min = row['y_min']
+        x_max = row['x_max']
+        y_max = row['y_max']
 
+        with rio.open(tile_path) as src:
+            crs = src.crs
 
+        height, width = mask_arr.shape
+        transform = rio_from_bounds(x_min, y_min, x_max, y_max, width, height)
 
+        base = os.path.splitext(os.path.basename(tile_path))[0]
+        out_path = os.path.join(out_dir, f'{base}_mask.tif')
 
+        with rio.open(
+            out_path,
+            'w',
+            driver='GTiff',
+            height=height,
+            width=width,
+            count=1,
+            dtype=mask_arr.dtype,
+            crs=crs,
+            transform=transform,
+        ) as dst:
+            dst.nodata = 0
+            dst.write(mask_arr, 1)
+            dst.write_colormap(1, _COLORMAP)
 
+        mask_tif_paths.append(out_path)
 
-    return
+    result_df = imgDF.copy()
+    result_df['mask_tif'] = mask_tif_paths
+    result_df = result_df[result_df['mask_tif'].notna()].reset_index(drop=True)
+
+    return result_df
 
 
 # Example usage with your JSON blob:
