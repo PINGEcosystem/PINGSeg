@@ -15,7 +15,7 @@ import inspect
 
 USER_DIR = os.path.expanduser('~')
 
-import PySimpleGUI as sg
+# import PySimpleGUI as sg
 
 def get_model_online(my_api_key: str,
                      my_model_name: str,
@@ -120,16 +120,16 @@ def get_model(utils_dir: str,):
     # Read model params
     my_model_id = '{}/{}'.format(my_model_name, my_model_ver)
 
-    # # Get the model
+    # Get the model
     # model = get_roboflow_model(model_id=my_model_id, api_key=my_api_key)
+    model = rf_get_model(model_id=my_model_id, api_key=my_api_key)
+    sys.exit()
 
     # Testing
     rf = roboflow.Roboflow(api_key=my_api_key)
     print(rf.workspace())
     project = rf.workspace().project(my_model_name)
     model = project.version(my_model_ver).model
-
-    model.download()
 
     print("Model type:", type(model))
     print("Attributes:", [a for a in dir(model) if not a.startswith("_")])
