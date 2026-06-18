@@ -22,6 +22,35 @@ from doodleverse_utils.imports import *
 from doodleverse_utils.model_imports import *
 from doodleverse_utils.prediction_imports import *
 
+
+def _resolve_seg_gym_model_files(modelDir: str):
+    '''
+    Resolve config and weights files from common model packaging layouts.
+    '''
+
+    config_candidates = [
+        os.path.join(modelDir, 'config.json'),
+    ]
+    config_candidates += sorted(glob(os.path.join(modelDir, 'config', '*.json')))
+    config_candidates = [p for p in config_candidates if os.path.exists(p)]
+
+    if not config_candidates:
+        raise FileNotFoundError(f"No config file found in model directory: {modelDir}")
+
+    weight_candidates = sorted(glob(os.path.join(modelDir, 'weights', '*_fullmodel.h5')))
+    if not weight_candidates:
+        weight_candidates = sorted(glob(os.path.join(modelDir, 'weights', '*.h5')))
+    if not weight_candidates:
+        weight_candidates = sorted(glob(os.path.join(modelDir, '*.h5')))
+
+    if not weight_candidates:
+        raise FileNotFoundError(
+            f"No Segmentation Gym weights file found in {modelDir}. "
+            "Expected *_fullmodel.h5 in weights/ or any .h5 in weights/ or model root."
+        )
+
+    return config_candidates[0], weight_candidates[0]
+
 #=======================================================================
 def get_model(modelDir: str,
               MODEL: str,
@@ -251,8 +280,7 @@ def seg_gym_folder(imgDF: pd.DataFrame,
         os.makedirs(out_dir)
 
     # Get necessary model files
-    configFile = glob(os.path.join(modelDir, 'config', '*.json'))[0]
-    weights = glob(os.path.join(modelDir, 'weights', '*_fullmodel.h5'))[0]
+    configFile, weights = _resolve_seg_gym_model_files(modelDir)
 
     # Get info from configfile
     with open(configFile) as f:
@@ -368,8 +396,7 @@ def seg_gym_folder_noDL(imgDF: pd.DataFrame,
         os.makedirs(out_dir)
 
     # Get necessary model files
-    configFile = glob(os.path.join(modelDir, 'config', '*.json'))[0]
-    weights = glob(os.path.join(modelDir, 'weights', '*_fullmodel.h5'))[0]
+    configFile, weights = _resolve_seg_gym_model_files(modelDir)
 
     # Get info from configfile
     with open(configFile) as f:
