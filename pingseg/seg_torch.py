@@ -111,10 +111,74 @@ def _get_model_image_size(config: dict) -> Tuple[int, int]:
 	return 224, 224
 
 
+IMAGE_NORM_METHODS = ("standardize", "minmax")
+
+
+def _normalize_chw(arr: np.ndarray, method: str, valid_mask: 'np.ndarray | None' = None) -> np.ndarray:
+	"""Normalize a (C, H, W) float32 array using the requested method.
+
+	'standardize' mirrors the training preprocessing (per-channel
+	``(x - mean) / std`` followed by a rescale to [0, 1]). 'minmax' is the
+	legacy per-tile min-max rescale.
+
+	When valid_mask (H, W) is provided, statistics (mean/std/min/max) are
+	computed only over valid (non-nodata) pixels so that edge/swath padding
+	doesn't skew the normalization, matching training tiles which contain no
+	padding.
+	"""
+
+	if valid_mask is not None and not np.all(valid_mask):
+		mask = valid_mask.astype(bool)
+		if not np.any(mask):
+			mask = None
+	else:
+		mask = None
+
+	if method == "standardize":
+		out = np.empty_like(arr, dtype=np.float32)
+		for c in range(arr.shape[0]):
+			band = arr[c]
+			stat_band = band[mask] if mask is not None else band
+			n_pixels = stat_band.size
+			std = float(np.nanstd(stat_band))
+			std = max(std, 1.0 / np.sqrt(n_pixels))
+			mean = float(np.nanmean(stat_band))
+			standardized = (band - mean) / std
+			stat_standardized = standardized[mask] if mask is not None else standardized
+			s_min = float(np.nanmin(stat_standardized))
+			s_max = float(np.nanmax(stat_standardized))
+			if s_max > s_min:
+				out[c] = np.clip((standardized - s_min) / (s_max - s_min), 0.0, 1.0)
+			else:
+				out[c] = 0.0
+		return out
+
+	# Legacy per-tile min-max normalization across all channels together.
+	stat_arr = arr[np.broadcast_to(mask, arr.shape)] if mask is not None else arr
+	arr_min = float(np.nanmin(stat_arr))
+	arr_max = float(np.nanmax(stat_arr))
+	if arr_max > arr_min:
+		return np.clip((arr - arr_min) / (arr_max - arr_min), 0.0, 1.0)
+	return np.zeros_like(arr, dtype=np.float32)
+
+
 def _load_tile_as_chw(path: str,
 					  target_hw: Tuple[int, int],
-					  num_channels: int = 3) -> np.ndarray:
-	"""Read a tile from disk and return float32 array shaped (C, H, W)."""
+					  num_channels: int = 3,
+					  norm_method: str = "standardize",
+					  image_mean=None,
+					  image_std=None) -> Tuple[np.ndarray, np.ndarray]:
+	"""Read a tile from disk and return (pixels, valid_mask).
+
+	pixels is a float32 array shaped (C, H, W) resized to target_hw. valid_mask
+	is a uint8 (H, W) array (1 = real sonar data, 0 = nodata/zero-padding),
+	resized to target_hw with nearest-neighbour interpolation.
+
+	image_mean/image_std, when provided, mirror the Hugging Face image
+	processor's do_normalize step (``(x - mean) / std`` per channel), applied
+	after tile standardization/rescale and resizing, matching training-time
+	preprocessing.
+	"""
 
 	import rasterio as rio
 
@@ -134,14 +198,13 @@ def _load_tile_as_chw(path: str,
 		pad = np.repeat(arr[-1:, :, :], num_channels - arr.shape[0], axis=0)
 		arr = np.concatenate([arr, pad], axis=0)
 
-	# Per-tile min-max normalization to [0, 1].
 	arr = arr.astype(np.float32)
-	arr_min = float(np.nanmin(arr))
-	arr_max = float(np.nanmax(arr))
-	if arr_max > arr_min:
-		arr = (arr - arr_min) / (arr_max - arr_min)
-	else:
-		arr.fill(0.0)
+
+	# doMovWin writes exactly 0 into nodata/edge-padded pixels, so a pixel is
+	# considered valid when any band carries a non-zero, non-NaN value.
+	valid_mask = np.any(arr != 0, axis=0) & ~np.any(np.isnan(arr), axis=0)
+
+	arr = _normalize_chw(arr, norm_method, valid_mask=valid_mask)
 
 	target_h, target_w = target_hw
 	if arr.shape[1] != target_h or arr.shape[2] != target_w:
@@ -152,17 +215,25 @@ def _load_tile_as_chw(path: str,
 		t = F.interpolate(t, size=(target_h, target_w), mode="bilinear", align_corners=False)
 		arr = t.squeeze(0).cpu().numpy()
 
-	return arr.astype(np.float32)
+		vm = torch.from_numpy(valid_mask.astype(np.float32))[None, None, ...]
+		vm = F.interpolate(vm, size=(target_h, target_w), mode="nearest")
+		valid_mask = vm.squeeze(0).squeeze(0).cpu().numpy() > 0.5
+
+	if image_mean is not None and image_std is not None:
+		arr = (arr - image_mean[:, None, None]) / image_std[:, None, None]
+
+	return arr.astype(np.float32), valid_mask.astype(np.uint8)
 
 
 def _save_npz_softmax(pred_chw: np.ndarray,
+					  valid_mask: np.ndarray,
 					  input_path: str,
 					  out_dir: str) -> str:
-	"""Persist one prediction array as compressed npz with key 'softmax'."""
+	"""Persist one prediction array as compressed npz with keys 'softmax' and 'valid'."""
 
 	base = os.path.splitext(os.path.basename(input_path))[0]
 	npz_path = os.path.join(out_dir, f"{base}.npz")
-	np.savez_compressed(npz_path, softmax=pred_chw.astype(np.float32))
+	np.savez_compressed(npz_path, softmax=pred_chw.astype(np.float32), valid=valid_mask.astype(np.uint8))
 	return npz_path
 
 
@@ -170,13 +241,23 @@ def seg_torch_folder(imgDF: pd.DataFrame,
 					 modelDir: str,
 					 out_dir: str,
 					 batch_size: int = 8,
-					 threadCnt: int = 4):
+					 threadCnt: int = 4,
+					 image_norm_method: str = "standardize"):
 	"""
 	Run semantic segmentation on image tiles using a local Transformers model.
 
 	The output format mirrors the Segmentation Gym backend:
-	each tile gets a .npz file with a 'softmax' array shaped (classes, H, W).
+	each tile gets a .npz file with a 'softmax' array shaped (classes, H, W)
+	and a 'valid' array shaped (H, W) flagging real sonar data vs. nodata.
+
+	image_norm_method : {'standardize', 'minmax'}
+		'standardize' reproduces the training-time per-image standardization
+		(``(x - mean) / std`` then rescaled to [0, 1]). 'minmax' is the legacy
+		per-tile min-max rescale.
 	"""
+
+	if image_norm_method not in IMAGE_NORM_METHODS:
+		raise ValueError(f"image_norm_method must be one of {IMAGE_NORM_METHODS}, got {image_norm_method!r}")
 
 	_prepare_windows_torch_runtime()
 
@@ -219,6 +300,21 @@ def seg_torch_folder(imgDF: pd.DataFrame,
 	if not model_type:
 		raise ValueError(f"Model config is missing 'model_type': {config_path}")
 
+	# Mirror the training-time Hugging Face image processor's do_normalize
+	# step (ImageNet mean/std by default), applied after standardize/rescale.
+	image_mean = None
+	image_std = None
+	preprocessor_config_path = os.path.join(modelDir, "preprocessor_config.json")
+	if os.path.exists(preprocessor_config_path):
+		with open(preprocessor_config_path, "r", encoding="utf-8") as f:
+			preprocessor_config_json = json.load(f)
+		if preprocessor_config_json.get("do_normalize", True):
+			mean = preprocessor_config_json.get("image_mean")
+			std = preprocessor_config_json.get("image_std")
+			if mean is not None and std is not None:
+				image_mean = np.asarray(mean, dtype=np.float32)
+				image_std = np.asarray(std, dtype=np.float32)
+
 	hf_config_kwargs = dict(model_config_json)
 	hf_config_kwargs.pop("model_type", None)
 	hf_config = AutoConfig.for_model(model_type, **hf_config_kwargs)
@@ -233,14 +329,26 @@ def seg_torch_folder(imgDF: pd.DataFrame,
 	with torch.no_grad():
 		for start in tqdm(range(0, len(file_paths), batch_size), desc="Torch segmentation"):
 			batch_paths = file_paths[start:start + batch_size]
-			batch_np = [_load_tile_as_chw(p, target_hw=target_hw, num_channels=model_channels) for p in batch_paths]
+			batch_loaded = [
+				_load_tile_as_chw(
+					p,
+					target_hw=target_hw,
+					num_channels=model_channels,
+					norm_method=image_norm_method,
+					image_mean=image_mean,
+					image_std=image_std,
+				)
+				for p in batch_paths
+			]
+			batch_np = [item[0] for item in batch_loaded]
+			batch_valid = [item[1] for item in batch_loaded]
 			pixel_values = torch.from_numpy(np.stack(batch_np, axis=0)).to(device)
 
 			logits = model(pixel_values=pixel_values).logits
 			logits = F.interpolate(logits, size=target_hw, mode="bilinear", align_corners=False)
 			probs = torch.softmax(logits, dim=1).cpu().numpy()
 
-			for pred, pth in zip(probs, batch_paths):
-				_save_npz_softmax(pred, pth, out_dir)
+			for pred, valid, pth in zip(probs, batch_valid, batch_paths):
+				_save_npz_softmax(pred, valid, pth, out_dir)
 
 	return imgDF
