@@ -52,6 +52,7 @@ target_size     = [512, 512]   # tile size in pixels sent to the model [H, W]
 # --- Inference / mapping ------------------------------------------------------
 mapRast         = True         # export mosaicked raster prediction
 mapShp          = True         # export prediction as shapefile
+keepIndividualMaps = False     # export separate maps per source mosaic (hard masks are not averaged)
 minPatchSize    = 3.0          # min polygon area (CRS units²) kept in shapefile
 smoothShp       = False        # simplify polygon boundaries
 smoothTol_m     = 0.5          # simplification tolerance (CRS units)
@@ -87,6 +88,7 @@ if __name__ == '__main__':
         threadCnt       = threadCnt,
         mosaicFileType  = mosaicFileType,
         deleteIntData   = deleteIntData,
+        keepIndividualMaps = keepIndividualMaps,
         minPatchSize    = minPatchSize,
         smoothShp       = smoothShp,
         smoothTol_m     = smoothTol_m,

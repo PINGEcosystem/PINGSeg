@@ -63,6 +63,7 @@ def do_work(
         threadCnt: float,
         mosaicFileType: str,
         deleteIntData: bool = True,
+        keepIndividualMaps: bool = False,
         minPatchSize: float = 3,
         smoothShp: bool = False,
         smoothTol_m: float = 0.5,
@@ -108,6 +109,9 @@ def do_work(
         Glob extension for mosaic files, e.g. ``'.tif'``.
     deleteIntData : bool
         Remove intermediate working directories when done.
+    keepIndividualMaps : bool
+        Export a separate raster and/or shapefile for each source mosaic and
+        retain the per-tile mask GeoTIFFs. Hard-label masks are not averaged.
     minPatchSize : float
         Minimum patch area (CRS units²) for small-object filtering.
     smoothShp : bool
@@ -197,6 +201,7 @@ def do_work(
             minArea_percent=minArea_percent,
             save_rgb=True,   # preserve colour for 3-band mosaics
         )
+        r['source_mosaic'] = os.path.splitext(os.path.basename(mosaic))[0]
         imagesAll.append(r)
 
     imagesDF = pd.concat(imagesAll, axis=0, ignore_index=True)
@@ -254,7 +259,13 @@ def do_work(
         out_mosaic = os.path.join(outDir, 'mosaic')
         os.makedirs(out_mosaic, exist_ok=True)
 
-        mosaic_maps(mask_files, out_mosaic, projName)
+        if keepIndividualMaps:
+            for source_name, group in imagesDF.groupby('source_mosaic'):
+                source_masks = group['mask_tif'].dropna().tolist()
+                if source_masks:
+                    mosaic_maps(source_masks, out_mosaic, f'{projName}_{source_name}')
+        else:
+            mosaic_maps(mask_files, out_mosaic, projName)
 
         print('\nDone!')
         print('Time (s):', round(time.time() - rast_start, ndigits=1))
@@ -271,15 +282,29 @@ def do_work(
         out_shp = os.path.join(outDir, 'map_shp')
         os.makedirs(out_shp, exist_ok=True)
 
-        maps2Shp_rf(
-            map_files=mask_files,
-            outDir=out_shp,
-            outName=projName,
-            class_map=class_map,
-            minPatchSize=minPatchSize,
-            smoothShp=smoothShp,
-            smoothTol_m=smoothTol_m,
-        )
+        if keepIndividualMaps:
+            for source_name, group in imagesDF.groupby('source_mosaic'):
+                source_masks = group['mask_tif'].dropna().tolist()
+                if source_masks:
+                    maps2Shp_rf(
+                        map_files=source_masks,
+                        outDir=out_shp,
+                        outName=f'{projName}_{source_name}',
+                        class_map=class_map,
+                        minPatchSize=minPatchSize,
+                        smoothShp=smoothShp,
+                        smoothTol_m=smoothTol_m,
+                    )
+        else:
+            maps2Shp_rf(
+                map_files=mask_files,
+                outDir=out_shp,
+                outName=projName,
+                class_map=class_map,
+                minPatchSize=minPatchSize,
+                smoothShp=smoothShp,
+                smoothTol_m=smoothTol_m,
+            )
 
         print('\nDone!')
         print('Time (s):', round(time.time() - shp_start, ndigits=1))
@@ -298,9 +323,8 @@ def do_work(
                 print(f'  {name} -> {path}')
                 shutil.rmtree(path, ignore_errors=True)
 
-        # Always remove per-tile masks after export (they sum to hundreds of
-        # individual GeoTIFFs)
-        shutil.rmtree(out_masks, ignore_errors=True)
+        if not keepIndividualMaps:
+            shutil.rmtree(out_masks, ignore_errors=True)
 
     print('\n\nAll done!')
     print('Total time (s):', round(time.time() - start_time, ndigits=1))
