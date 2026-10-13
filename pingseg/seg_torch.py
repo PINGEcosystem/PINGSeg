@@ -6,10 +6,12 @@ PyTorch/Transformers segmentation workflow for local Hugging Face models.
 
 #########
 # Imports
+import gc
 import os
 import sys
 import json
 from typing import List, Tuple
+from concurrent.futures import ThreadPoolExecutor
 
 
 def _preload_windows_torch_backend() -> None:
@@ -237,12 +239,28 @@ def _save_npz_softmax(pred_chw: np.ndarray,
 	return npz_path
 
 
+class _TileDataset:
+	"""Map-style dataset so DataLoader workers can prefetch/normalize tiles."""
+
+	def __init__(self, paths, **load_kwargs):
+		self.paths = paths
+		self.load_kwargs = load_kwargs
+
+	def __len__(self):
+		return len(self.paths)
+
+	def __getitem__(self, idx):
+		pixels, valid = _load_tile_as_chw(self.paths[idx], **self.load_kwargs)
+		return pixels, valid, self.paths[idx]
+
+
 def seg_torch_folder(imgDF: pd.DataFrame,
 					 modelDir: str,
 					 out_dir: str,
 					 batch_size: int = 8,
 					 threadCnt: int = 4,
-					 image_norm_method: str = "standardize"):
+					 image_norm_method: str = "standardize",
+					 use_amp: bool = True):
 	"""
 	Run semantic segmentation on image tiles using a local Transformers model.
 
@@ -281,7 +299,7 @@ def seg_torch_folder(imgDF: pd.DataFrame,
 			"If using conda, prefer a single channel family for scientific libs to reduce runtime conflicts."
 		) from exc
 
-	del threadCnt  # kept for API compatibility
+	threadCnt = max(1, int(threadCnt))
 
 	os.makedirs(out_dir, exist_ok=True)
 
@@ -326,29 +344,54 @@ def seg_torch_folder(imgDF: pd.DataFrame,
 
 	file_paths: List[str] = imgDF["mosaic"].tolist()
 
-	with torch.no_grad():
-		for start in tqdm(range(0, len(file_paths), batch_size), desc="Torch segmentation"):
-			batch_paths = file_paths[start:start + batch_size]
-			batch_loaded = [
-				_load_tile_as_chw(
-					p,
-					target_hw=target_hw,
-					num_channels=model_channels,
-					norm_method=image_norm_method,
-					image_mean=image_mean,
-					image_std=image_std,
-				)
-				for p in batch_paths
-			]
-			batch_np = [item[0] for item in batch_loaded]
-			batch_valid = [item[1] for item in batch_loaded]
-			pixel_values = torch.from_numpy(np.stack(batch_np, axis=0)).to(device)
+	try:
+		dataset = _TileDataset(
+			file_paths,
+			target_hw=target_hw,
+			num_channels=model_channels,
+			norm_method=image_norm_method,
+			image_mean=image_mean,
+			image_std=image_std,
+		)
+		loader = torch.utils.data.DataLoader(
+			dataset,
+			batch_size=batch_size,
+			shuffle=False,
+			num_workers=threadCnt,
+			pin_memory=(device.type == "cuda"),
+			persistent_workers=False,
+		)
 
-			logits = model(pixel_values=pixel_values).logits
-			logits = F.interpolate(logits, size=target_hw, mode="bilinear", align_corners=False)
-			probs = torch.softmax(logits, dim=1).cpu().numpy()
+		amp_enabled = bool(use_amp) and device.type == "cuda"
+		max_pending = threadCnt * 4
+		pending = []
 
-			for pred, valid, pth in zip(probs, batch_valid, batch_paths):
-				_save_npz_softmax(pred, valid, pth, out_dir)
+		# Compressed npz writing releases the GIL, so threads overlap it with GPU work.
+		with ThreadPoolExecutor(max_workers=threadCnt) as pool, torch.inference_mode():
+			for pixel_values, valid_batch, paths in tqdm(loader, desc="Torch segmentation"):
+				pixel_values = pixel_values.to(device, non_blocking=True)
+
+				with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
+					logits = model(pixel_values=pixel_values).logits
+				logits = F.interpolate(logits.float(), size=target_hw, mode="bilinear", align_corners=False)
+				probs = torch.softmax(logits, dim=1).cpu().numpy()
+				valid_np = valid_batch.numpy()
+
+				for pred, valid, pth in zip(probs, valid_np, paths):
+					pending.append(pool.submit(_save_npz_softmax, pred, valid, pth, out_dir))
+
+				# Bound memory by draining finished/oldest writes and surfacing errors.
+				while len(pending) > max_pending:
+					pending.pop(0).result()
+
+			for fut in pending:
+				fut.result()
+	finally:
+		# Release GPU memory held by the model and cached allocator blocks.
+		del model
+		gc.collect()
+		if device.type == "cuda":
+			torch.cuda.empty_cache()
+			torch.cuda.ipc_collect()
 
 	return imgDF
